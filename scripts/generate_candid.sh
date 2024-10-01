@@ -1,0 +1,1 @@
+cargo build --release --target wasm32-unknown-unknown --package basic_ethereum && target/wasm32-unknown-unknown/release/basic_ethereum.wasm && candid-extractor target/wasm32-unknown-unknown/release/basic_ethereum.wasm > basic_ethereum2.did

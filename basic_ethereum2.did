@@ -1,0 +1,94 @@
+type BlockTag = variant {
+  Earliest;
+  Safe;
+  Finalized;
+  Latest;
+  Number : nat;
+  Pending;
+};
+type EcdsaKeyName = variant {
+  ProductionKey1;
+  TestKeyLocalDevelopment;
+  TestKey1;
+};
+type EthMainnetService = variant {
+  Alchemy;
+  BlockPi;
+  Cloudflare;
+  PublicNode;
+  Ankr;
+};
+type EthSepoliaService = variant { Alchemy; BlockPi; PublicNode; Ankr };
+type EthereumNetwork = variant { Mainnet; Sepolia };
+type HttpHeader = record { value : text; name : text };
+type HttpOutcallError = variant {
+  IcError : record { code : RejectionCode; message : text };
+  InvalidHttpJsonRpcResponse : record {
+    status : nat16;
+    body : text;
+    parsingError : opt text;
+  };
+};
+type InitArg = record {
+  ethereum_network : opt EthereumNetwork;
+  ecdsa_key_name : opt EcdsaKeyName;
+};
+type JsonRpcError = record { code : int64; message : text };
+type MultiSendRawTransactionResult = variant {
+  Consistent : SendRawTransactionResult;
+  Inconsistent : vec record { RpcService; SendRawTransactionResult };
+};
+type ProviderError = variant {
+  TooFewCycles : record { expected : nat; received : nat };
+  MissingRequiredProvider;
+  ProviderNotFound;
+  NoPermission;
+};
+type RejectionCode = variant {
+  NoError;
+  CanisterError;
+  SysTransient;
+  DestinationInvalid;
+  Unknown;
+  SysFatal;
+  CanisterReject;
+};
+type RpcApi = record { url : text; headers : opt vec HttpHeader };
+type RpcError = variant {
+  JsonRpcError : JsonRpcError;
+  ProviderError : ProviderError;
+  ValidationError : ValidationError;
+  HttpOutcallError : HttpOutcallError;
+};
+type RpcService = variant {
+  EthSepolia : EthSepoliaService;
+  Custom : RpcApi;
+  EthMainnet : EthMainnetService;
+  Chain : nat64;
+  Provider : nat64;
+};
+type SendRawTransactionResult = variant {
+  Ok : SendRawTransactionStatus;
+  Err : RpcError;
+};
+type SendRawTransactionStatus = variant {
+  Ok : opt text;
+  NonceTooLow;
+  NonceTooHigh;
+  InsufficientFunds;
+};
+type ValidationError = variant {
+  CredentialPathNotAllowed;
+  HostNotAllowed : text;
+  CredentialHeaderNotAllowed;
+  UrlParseError : text;
+  Custom : text;
+  InvalidHex : text;
+};
+service : (opt InitArg) -> {
+  estimate_transaction_fees_real : () -> (nat, nat, nat);
+  ethereum_address : (opt principal) -> (text);
+  get_balance : (opt text) -> (nat);
+  send_eth : (text, nat) -> (text, nat64, MultiSendRawTransactionResult);
+  transaction_count : (opt principal, opt BlockTag) -> (nat);
+}
