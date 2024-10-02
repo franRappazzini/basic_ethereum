@@ -86,6 +86,8 @@ type ValidationError = variant {
   InvalidHex : text;
 };
 service : (opt InitArg) -> {
+  calculate_gas_limit : () -> (nat);
+  call_custom_sc : () -> (text, nat64, MultiSendRawTransactionResult);
   estimate_transaction_fees_real : () -> (nat, nat, nat);
   ethereum_address : (opt principal) -> (text);
   get_balance : (opt text) -> (nat);
