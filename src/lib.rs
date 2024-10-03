@@ -218,6 +218,7 @@ fn estimate_transaction_fees() -> (u128, u128, u128) {
 
 #[update]
 async fn avg_fees(block_count: u8) -> (u128, u128) {
+    // TODO (fran): estimar cycles automaticamente
     let num_cycles = 1_000_000_000u128;
     let ethereum_network = read_state(|s| s.ethereum_network());
 
@@ -236,7 +237,6 @@ async fn avg_fees(block_count: u8) -> (u128, u128) {
         rewardPercentiles: None,
     };
 
-    // TODO (fran): algunas veces retorna "No consensus could be reached. Replicas had different responses"
     let (response,) = EVM_RPC
         .eth_fee_history(rpc_services, None, fee_history_args, num_cycles)
         .await
@@ -245,12 +245,14 @@ async fn avg_fees(block_count: u8) -> (u128, u128) {
     let (max_fee_per_gas, max_priority_fee_per_gas) = match response {
         MultiFeeHistoryResult::Consistent(fee_history_result) => match fee_history_result {
             FeeHistoryResult::Ok(val) => {
+                // parse the last 5 blocks
+
                 let val = val.unwrap();
                 let base_fees = &val.baseFeePerGas;
                 // let rewards = &val.reward;
 
                 let last_x_fees = &base_fees[base_fees.len() - 5..];
-                // let last_x_rewards = &rewards[rewards.len() - 5..]; // FIXME (fran): rewards is empty
+                // let last_x_rewards = &rewards[rewards.len() - 5..]; // FIXME (fran): rewards is empty => creo que porque es sepolia
 
                 let total_fee: u128 = last_x_fees.iter().map(|n| nat_to_u128(n.clone())).sum();
                 // let total_reward: u128 = last_x_rewards
@@ -282,26 +284,25 @@ async fn avg_fees(block_count: u8) -> (u128, u128) {
 }
 
 #[update]
-async fn calculate_gas_limit(value: String, data: String) -> u128 {
-    // TODO (fran): el data es para ese unico sc => ver como automatizar esto
-
+async fn calculate_gas_limit(from: String, to: String, value: String, data: String) -> u128 {
     let json = format!(
         r#"{{
             "jsonrpc": "2.0",
             "method": "eth_estimateGas",
             "params": [
                 {{
-                "from": "0x22Ff826A4af6408bdC07a63435744B61c0e71A1F",
-                "to": "0x46D1239bB2b9E0b1e14E475FD86ed4a3C3C1e31E",
+                "from": "{}",
+                "to": "{}",
                 "value": "{}",
                 "data": "{}"
                 }}
             ],
             "id": 1
         }}"#,
-        value, data
+        from, to, value, data
     );
 
+    // TODO (fran): automatizar cycles
     let max_response_size_bytes = 1000_u64;
     let num_cycles = 1_000_000_000u128;
 
@@ -312,7 +313,6 @@ async fn calculate_gas_limit(value: String, data: String) -> u128 {
         EthereumNetwork::Sepolia => RpcService::EthSepolia(EthSepoliaService::PublicNode),
     };
 
-    // TODO (fran): algunas veces retorna "No consensus could be reached. Replicas had different responses"
     let (response,) = EVM_RPC
         .request(
             rpc_service,
@@ -322,8 +322,6 @@ async fn calculate_gas_limit(value: String, data: String) -> u128 {
         )
         .await
         .expect("RPC call failed");
-
-    // response
 
     match response {
         RequestResult::Ok(estimate_gas) => {
@@ -361,23 +359,27 @@ async fn update_call_custom_contract(
 
     let data_hex = create_hex_data(abi, &function_name, &[Token::Uint(20_000_000_u64.into())]);
 
+    let wallet = EthereumWallet::new(caller).await;
+    let to = "0x46D1239bB2b9E0b1e14E475FD86ed4a3C3C1e31E";
+
     let tx: TxEip1559 = TxEip1559 {
         chain_id,
         nonce,
-        gas_limit: calculate_gas_limit(value_hex, to_0x(data_hex.clone())).await,
+        gas_limit: calculate_gas_limit(
+            wallet.ethereum_address().to_string(),
+            to.to_string(),
+            value_hex,
+            to_0x(data_hex.clone()),
+        )
+        .await,
         max_fee_per_gas,
         max_priority_fee_per_gas,
-        to: TxKind::Call(
-            "0x46D1239bB2b9E0b1e14E475FD86ed4a3C3C1e31E"
-                .parse()
-                .expect("failed to parse recipient address"),
-        ),
+        to: TxKind::Call(to.parse().expect("failed to parse recipient address")),
         value: nat_to_u256(Nat::from(value)),
         input: Bytes::from_hex(data_hex).expect("failed to parse input"),
         access_list: Default::default(),
     };
 
-    let wallet = EthereumWallet::new(caller).await;
     let tx_hash = tx.signature_hash().0;
     let (raw_signature, recovery_id) = wallet.sign_with_ecdsa(tx_hash).await;
     let signature = Signature::from_bytes_and_parity(&raw_signature, recovery_id.is_y_odd())
