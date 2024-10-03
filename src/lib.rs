@@ -396,7 +396,7 @@ async fn update_call_custom_contract(
         raw_transaction_hash
     );
     // The canister is sending a signed statement, meaning a malicious provider could only affect availability.
-    // For demonstration purposes, the canister uses a single provider to send the signed transaction,
+    // TODO (fran): For demonstration purposes, the canister uses a single provider to send the signed transaction,
     // but in production multiple providers (e.g., using a round-robin strategy) should be used to avoid a single point of failure.
     let single_rpc_service = read_state(|s| s.single_evm_rpc_service());
     let (result,) = EVM_RPC
@@ -424,24 +424,12 @@ async fn update_call_custom_contract(
     );
 
     (raw_transaction_hash.to_string(), nonce, result)
-
-    // let result = call_contract(
-    //     &network,
-    //     contract_address,
-    //     abi,
-    //     "ownerOf",
-    //     &[Token::Uint(token_id.into())],
-    // )
-    // .await;
-    // match result.get(0) {
-    //     Some(Token::Address(a)) => to_hex(a.as_bytes()),
-    //     _ => panic!("Unexpected result"),
-    // }
 }
 
 #[update]
 async fn query_call_custom_contact(function_name: String) -> u128 {
     let abi = &TEST.with(Rc::clone);
+
     let result = call_contract(
         "sepolia",
         "0x46D1239bB2b9E0b1e14E475FD86ed4a3C3C1e31E".to_string(),
@@ -452,6 +440,7 @@ async fn query_call_custom_contact(function_name: String) -> u128 {
         )],
     )
     .await;
+
     match result.get(0) {
         Some(Token::Uint(n)) => n.as_u128(),
         _ => panic!("Unexpected result"),
