@@ -1,6 +1,7 @@
 mod ecdsa;
 mod ethereum_wallet;
 mod state;
+mod utils;
 
 use crate::ethereum_wallet::EthereumWallet;
 use crate::state::{init_state, read_state};
@@ -9,6 +10,9 @@ use alloy_eips::eip6110::DepositRequest;
 use alloy_primitives::hex::FromHex;
 use alloy_primitives::{hex, keccak256, Bytes, Signature, TxKind, U256};
 use candid::{CandidType, Deserialize, Nat, Principal};
+use ethers_core::abi::Contract;
+use ethers_core::abi::{Abi, Token};
+use ethers_core::types::Address;
 use evm_rpc_canister_types::{
     BlockTag, EthMainnetService, EthSepoliaService, EvmRpcCanister, FeeHistory, FeeHistoryArgs,
     FeeHistoryResult, GetTransactionCountArgs, GetTransactionCountResult, MultiFeeHistoryResult,
@@ -16,15 +20,20 @@ use evm_rpc_canister_types::{
     RpcServices,
 };
 use ic_cdk::api::management_canister::ecdsa::{EcdsaCurve, EcdsaKeyId};
-use ic_cdk::{init, update};
-use ic_ethereum_types::Address;
+use ic_cdk::api::management_canister::http_request::{HttpResponse, TransformArgs};
+use ic_cdk::{init, query, update};
 use num::{BigUint, Num};
 use serde::Serialize;
+use std::rc::Rc;
 use std::str::FromStr;
-
+use utils::{call_contract, create_hex_data, to_0x};
 pub const EVM_RPC_CANISTER_ID: Principal =
     Principal::from_slice(b"\x00\x00\x00\x00\x02\x30\x00\xCC\x01\x01"); // 7hfb6-caaaa-aaaar-qadga-cai
 pub const EVM_RPC: EvmRpcCanister = EvmRpcCanister(EVM_RPC_CANISTER_ID);
+
+thread_local! {
+    static TEST: Rc<Contract> = Rc::new(include_abi!("./abi/Test.json"))
+}
 
 #[init]
 pub fn init(maybe_init: Option<InitArg>) {
@@ -273,176 +282,8 @@ async fn avg_fees(block_count: u8) -> (u128, u128) {
 }
 
 #[update]
-async fn call_custom_sc() -> (String, u64, MultiSendRawTransactionResult) {
-    use alloy_eips::eip2718::Encodable2718;
-
-    let caller = validate_caller_not_anonymous();
-    // let _to_address = Address::from_str(&to).unwrap_or_else(|e| {
-    //     ic_cdk::trap(&format!("failed to parse the recipient address: {:?}", e))
-    // });
-    let chain_id = read_state(|s| s.ethereum_network().chain_id());
-    let nonce = nat_to_u64(transaction_count(Some(caller), Some(BlockTag::Pending)).await);
-    let (_gas_limit, max_fee_per_gas, max_priority_fee_per_gas) = estimate_transaction_fees();
-
-    let value = 0u8;
-    let value_hex = format!("0x{:x}", value);
-
-    let tx: TxEip1559 = TxEip1559 {
-        chain_id,
-        nonce,
-        gas_limit: calculate_gas_limit(
-            value_hex,
-            "0x5524107700000000000000000000000000000000000000000000000000000000001e8480"
-                .to_string(),
-        )
-        .await, // TODO (fran): ver como automatizar esto
-        max_fee_per_gas,
-        max_priority_fee_per_gas,
-        to: TxKind::Call(
-            "0x46D1239bB2b9E0b1e14E475FD86ed4a3C3C1e31E"
-                .parse()
-                .expect("failed to parse recipient address"),
-        ),
-        value: nat_to_u256(Nat::from(0u8)),
-        input: Bytes::from_hex(
-            "552410770000000000000000000000000000000000000000000000000000000000000007", // TODO (fran) ver como automatizar esto => tal vez importando el abi
-        )
-        .expect("failed to parse input"),
-        access_list: Default::default(),
-    };
-
-    let wallet = EthereumWallet::new(caller).await;
-    let tx_hash = tx.signature_hash().0;
-    let (raw_signature, recovery_id) = wallet.sign_with_ecdsa(tx_hash).await;
-    let signature = Signature::from_bytes_and_parity(&raw_signature, recovery_id.is_y_odd())
-        .expect("BUG: failed to create a signature");
-    let signed_tx = tx.into_signed(signature);
-
-    let raw_transaction_hash = *signed_tx.hash();
-    let mut tx_bytes: Vec<u8> = vec![];
-    TxEnvelope::from(signed_tx).encode_2718(&mut tx_bytes);
-    let raw_transaction_hex = format!("0x{}", hex::encode(&tx_bytes));
-    ic_cdk::println!(
-        "Sending raw transaction hex {} with transaction hash {}",
-        raw_transaction_hex,
-        raw_transaction_hash
-    );
-    // The canister is sending a signed statement, meaning a malicious provider could only affect availability.
-    // For demonstration purposes, the canister uses a single provider to send the signed transaction,
-    // but in production multiple providers (e.g., using a round-robin strategy) should be used to avoid a single point of failure.
-    let single_rpc_service = read_state(|s| s.single_evm_rpc_service());
-    let (result,) = EVM_RPC
-        .eth_send_raw_transaction(
-            single_rpc_service,
-            None,
-            raw_transaction_hex.clone(),
-            2_000_000_000_u128,
-        )
-        .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "failed to send raw transaction {}, error: {:?}",
-                raw_transaction_hex, e
-            )
-        });
-    ic_cdk::println!(
-        "Result of sending raw transaction {}: {:?}. \
-    Due to the replicated nature of HTTPs outcalls, an error such as transaction already known or nonce too low could be reported, \
-    even though the transaction was successfully sent. \
-    Check whether the transaction appears on Etherscan or check that the transaction count on \
-    that address at latest block height did increase.",
-        raw_transaction_hex,
-        result
-    );
-
-    (raw_transaction_hash.to_string(), nonce, result)
-}
-
-#[update]
-async fn call_custom_sc2() -> (String, u64, MultiSendRawTransactionResult) {
-    use alloy_eips::eip2718::Encodable2718;
-
-    let caller = validate_caller_not_anonymous();
-    // let _to_address = Address::from_str(&to).unwrap_or_else(|e| {
-    //     ic_cdk::trap(&format!("failed to parse the recipient address: {:?}", e))
-    // });
-    let chain_id = read_state(|s| s.ethereum_network().chain_id());
-    let nonce = nat_to_u64(transaction_count(Some(caller), Some(BlockTag::Pending)).await);
-    let (_gas_limit, max_fee_per_gas, max_priority_fee_per_gas) = estimate_transaction_fees();
-
-    let value = 2_000_000_000_000_u128;
-    let value_hex = format!("0x{:x}", value);
-
-    let tx: TxEip1559 = TxEip1559 {
-        chain_id,
-        nonce,
-        gas_limit: calculate_gas_limit(value_hex, "0x80f2d4f0".to_string()).await, // TODO (fran): ver como automatizar esto
-        max_fee_per_gas,
-        max_priority_fee_per_gas,
-        to: TxKind::Call(
-            "0x46D1239bB2b9E0b1e14E475FD86ed4a3C3C1e31E"
-                .parse()
-                .expect("failed to parse recipient address"),
-        ),
-        value: nat_to_u256(Nat::from(2_000_000_000_000_u128)),
-        input: Bytes::from_hex(
-            "0x80f2d4f0", // TODO (fran) ver como automatizar esto => tal vez importando el abi
-        )
-        .expect("failed to parse input"),
-        access_list: Default::default(),
-    };
-
-    let wallet = EthereumWallet::new(caller).await;
-    let tx_hash = tx.signature_hash().0;
-    let (raw_signature, recovery_id) = wallet.sign_with_ecdsa(tx_hash).await;
-    let signature = Signature::from_bytes_and_parity(&raw_signature, recovery_id.is_y_odd())
-        .expect("BUG: failed to create a signature");
-    let signed_tx = tx.into_signed(signature);
-
-    let raw_transaction_hash = *signed_tx.hash();
-    let mut tx_bytes: Vec<u8> = vec![];
-    TxEnvelope::from(signed_tx).encode_2718(&mut tx_bytes);
-    let raw_transaction_hex = format!("0x{}", hex::encode(&tx_bytes));
-    ic_cdk::println!(
-        "Sending raw transaction hex {} with transaction hash {}",
-        raw_transaction_hex,
-        raw_transaction_hash
-    );
-    // The canister is sending a signed statement, meaning a malicious provider could only affect availability.
-    // For demonstration purposes, the canister uses a single provider to send the signed transaction,
-    // but in production multiple providers (e.g., using a round-robin strategy) should be used to avoid a single point of failure.
-    let single_rpc_service = read_state(|s| s.single_evm_rpc_service());
-    let (result,) = EVM_RPC
-        .eth_send_raw_transaction(
-            single_rpc_service,
-            None,
-            raw_transaction_hex.clone(),
-            2_000_000_000_u128,
-        )
-        .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "failed to send raw transaction {}, error: {:?}",
-                raw_transaction_hex, e
-            )
-        });
-    ic_cdk::println!(
-        "Result of sending raw transaction {}: {:?}. \
-    Due to the replicated nature of HTTPs outcalls, an error such as transaction already known or nonce too low could be reported, \
-    even though the transaction was successfully sent. \
-    Check whether the transaction appears on Etherscan or check that the transaction count on \
-    that address at latest block height did increase.",
-        raw_transaction_hex,
-        result
-    );
-
-    (raw_transaction_hash.to_string(), nonce, result)
-}
-
-#[update]
 async fn calculate_gas_limit(value: String, data: String) -> u128 {
-    // TODO (fran): ver como automatizar esto
-    // TODO (fran): el data es para ese unico sc
+    // TODO (fran): el data es para ese unico sc => ver como automatizar esto
 
     let json = format!(
         r#"{{
@@ -497,77 +338,122 @@ async fn calculate_gas_limit(value: String, data: String) -> u128 {
     }
 }
 
+// TODO (fran): setear bien cantidad de cycles para llamados
+// https://internetcomputer.org/docs/current/developer-docs/multi-chain/ethereum/evm-rpc/costs#attaching-the-correct-amount-of-cycles
 #[update]
-async fn calculate_gas_limit2() -> String {
-    // TODO (fran): ver como automatizar esto
-    // TODO (fran): el data es para ese unico sc
+async fn update_call_custom_contract(
+    function_name: String,
+    value: u128,
+) -> (String, u64, MultiSendRawTransactionResult) {
+    use alloy_eips::eip2718::Encodable2718;
 
-    let function_signature = "setValue(uint256)";
-    let function_hash = keccak256(function_signature);
-    let selector = &function_hash[..4]; // Primeros 4 bytes (8 caracteres hexadecimales)
+    let caller = validate_caller_not_anonymous();
+    // let _to_address = Address::from_str(&to).unwrap_or_else(|e| {
+    //     ic_cdk::trap(&format!("failed to parse the recipient address: {:?}", e))
+    // });
+    let chain_id = read_state(|s| s.ethereum_network().chain_id());
+    let nonce = nat_to_u64(transaction_count(Some(caller), Some(BlockTag::Pending)).await);
+    let (_gas_limit, max_fee_per_gas, max_priority_fee_per_gas) = estimate_transaction_fees();
 
-    // Paso 2: Convertir 2000000 a hexadecimal, 32 bytes alineados
-    let argument = 2000000u64;
-    let mut argument_encoded = vec![0u8; 32]; // 32 bytes llenos de ceros
-    argument_encoded[32 - 8..].copy_from_slice(&argument.to_be_bytes()); // Rellenar desde la derecha
+    // let value = 0u8;
+    let value_hex = format!("0x{:x}", value);
+    let abi = &TEST.with(Rc::clone);
 
-    // Paso 3: Construir el payload completo (selector + argumento)
-    let mut data = Vec::new();
-    data.extend_from_slice(selector); // Agregar selector
-    data.extend_from_slice(&argument_encoded); // Agregar el argumento codificado
+    let data_hex = create_hex_data(abi, &function_name, &[Token::Uint(20_000_000_u64.into())]);
 
-    let hex = hex::encode(data);
+    let tx: TxEip1559 = TxEip1559 {
+        chain_id,
+        nonce,
+        gas_limit: calculate_gas_limit(value_hex, to_0x(data_hex.clone())).await,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+        to: TxKind::Call(
+            "0x46D1239bB2b9E0b1e14E475FD86ed4a3C3C1e31E"
+                .parse()
+                .expect("failed to parse recipient address"),
+        ),
+        value: nat_to_u256(Nat::from(value)),
+        input: Bytes::from_hex(data_hex).expect("failed to parse input"),
+        access_list: Default::default(),
+    };
 
-    hex
+    let wallet = EthereumWallet::new(caller).await;
+    let tx_hash = tx.signature_hash().0;
+    let (raw_signature, recovery_id) = wallet.sign_with_ecdsa(tx_hash).await;
+    let signature = Signature::from_bytes_and_parity(&raw_signature, recovery_id.is_y_odd())
+        .expect("BUG: failed to create a signature");
+    let signed_tx = tx.into_signed(signature);
 
-    // let json = r#"{
-    //         "jsonrpc": "2.0",
-    //         "method": "eth_estimateGas",
-    //         "params": [
-    //             {
-    //             "from": "0x22Ff826A4af6408bdC07a63435744B61c0e71A1F",
-    //             "to": "0x46D1239bB2b9E0b1e14E475FD86ed4a3C3C1e31E",
-    //             "value": "0x71AFD498D0000",
-    //             "gas": "0x5EE8"
-    //             }
-    //         ],
-    //         "id": 1
-    //     }"#;
+    let raw_transaction_hash = *signed_tx.hash();
+    let mut tx_bytes: Vec<u8> = vec![];
+    TxEnvelope::from(signed_tx).encode_2718(&mut tx_bytes);
+    let raw_transaction_hex = format!("0x{}", hex::encode(&tx_bytes));
+    ic_cdk::println!(
+        "Sending raw transaction hex {} with transaction hash {}",
+        raw_transaction_hex,
+        raw_transaction_hash
+    );
+    // The canister is sending a signed statement, meaning a malicious provider could only affect availability.
+    // For demonstration purposes, the canister uses a single provider to send the signed transaction,
+    // but in production multiple providers (e.g., using a round-robin strategy) should be used to avoid a single point of failure.
+    let single_rpc_service = read_state(|s| s.single_evm_rpc_service());
+    let (result,) = EVM_RPC
+        .eth_send_raw_transaction(
+            single_rpc_service,
+            None,
+            raw_transaction_hex.clone(),
+            2_000_000_000_u128,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "failed to send raw transaction {}, error: {:?}",
+                raw_transaction_hex, e
+            )
+        });
+    ic_cdk::println!(
+        "Result of sending raw transaction {}: {:?}. \
+    Due to the replicated nature of HTTPs outcalls, an error such as transaction already known or nonce too low could be reported, \
+    even though the transaction was successfully sent. \
+    Check whether the transaction appears on Etherscan or check that the transaction count on \
+    that address at latest block height did increase.",
+        raw_transaction_hex,
+        result
+    );
 
-    // let max_response_size_bytes = 1000_u64;
-    // let num_cycles = 2_000_000_000u128;
+    (raw_transaction_hash.to_string(), nonce, result)
 
-    // let ethereum_network = read_state(|s| s.ethereum_network());
-
-    // let rpc_service = match ethereum_network {
-    //     EthereumNetwork::Mainnet => RpcService::EthMainnet(EthMainnetService::PublicNode),
-    //     EthereumNetwork::Sepolia => RpcService::EthSepolia(EthSepoliaService::PublicNode),
-    // };
-
-    // // TODO (fran): algunas veces retorna "No consensus could be reached. Replicas had different responses"
-    // let (response,) = EVM_RPC
-    //     .request(
-    //         rpc_service,
-    //         json.to_string(),
-    //         max_response_size_bytes,
-    //         num_cycles,
-    //     )
-    //     .await
-    //     .expect("RPC call failed");
-
-    // response
-
-    // match response {
-    //     RequestResult::Ok(estimate_gas) => {
-    //         let eth_estimate_gas: EthEstimateGasResponse =
-    //             serde_json::from_str(&estimate_gas).unwrap();
-
-    //         let hex_gas = eth_estimate_gas.result;
-    //         let gas_used = u128::from_str_radix(&hex_gas[2..], 16).unwrap();
-    //         gas_used
-    //     }
-    //     RequestResult::Err(e) => panic!("Received an error response: {:?}", e),
+    // let result = call_contract(
+    //     &network,
+    //     contract_address,
+    //     abi,
+    //     "ownerOf",
+    //     &[Token::Uint(token_id.into())],
+    // )
+    // .await;
+    // match result.get(0) {
+    //     Some(Token::Address(a)) => to_hex(a.as_bytes()),
+    //     _ => panic!("Unexpected result"),
     // }
+}
+
+#[update]
+async fn query_call_custom_contact(function_name: String) -> u128 {
+    let abi = &TEST.with(Rc::clone);
+    let result = call_contract(
+        "sepolia",
+        "0x46D1239bB2b9E0b1e14E475FD86ed4a3C3C1e31E".to_string(),
+        abi,
+        &function_name,
+        &[Token::Address(
+            Address::from_str("0x22Ff826A4af6408bdC07a63435744B61c0e71A1F").unwrap(),
+        )],
+    )
+    .await;
+    match result.get(0) {
+        Some(Token::Uint(n)) => n.as_u128(),
+        _ => panic!("Unexpected result"),
+    }
 }
 
 #[derive(CandidType, Deserialize, Debug, Default, PartialEq, Eq)]
@@ -670,6 +556,17 @@ struct EthEstimateGasResponse {
     id: u32,
     jsonrpc: String,
     result: String,
+}
+
+#[query]
+fn transform(args: TransformArgs) -> HttpResponse {
+    HttpResponse {
+        status: args.response.status.clone(),
+        body: args.response.body,
+        // Strip headers as they contain the Date which is not necessarily the same
+        // and will prevent consensus on the result.
+        headers: Vec::new(),
+    }
 }
 
 // Enable Candid export

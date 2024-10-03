@@ -29,6 +29,11 @@ type HttpOutcallError = variant {
     parsingError : opt text;
   };
 };
+type HttpResponse = record {
+  status : nat;
+  body : blob;
+  headers : vec HttpHeader;
+};
 type InitArg = record {
   ethereum_network : opt EthereumNetwork;
   ecdsa_key_name : opt EcdsaKeyName;
@@ -77,6 +82,7 @@ type SendRawTransactionStatus = variant {
   NonceTooHigh;
   InsufficientFunds;
 };
+type TransformArgs = record { context : blob; response : HttpResponse };
 type ValidationError = variant {
   CredentialPathNotAllowed;
   HostNotAllowed : text;
@@ -88,11 +94,15 @@ type ValidationError = variant {
 service : (opt InitArg) -> {
   avg_fees : (nat8) -> (nat, nat);
   calculate_gas_limit : (text, text) -> (nat);
-  calculate_gas_limit2 : () -> (text);
-  call_custom_sc : () -> (text, nat64, MultiSendRawTransactionResult);
-  call_custom_sc2 : () -> (text, nat64, MultiSendRawTransactionResult);
   ethereum_address : (opt principal) -> (text);
   get_balance : (opt text) -> (nat);
+  query_call_custom_contact : (text) -> (nat);
   send_eth : (text, nat) -> (text, nat64, MultiSendRawTransactionResult);
   transaction_count : (opt principal, opt BlockTag) -> (nat);
+  transform : (TransformArgs) -> (HttpResponse) query;
+  update_call_custom_contract : (text, nat) -> (
+      text,
+      nat64,
+      MultiSendRawTransactionResult,
+    );
 }
