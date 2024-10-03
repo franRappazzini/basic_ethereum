@@ -7,12 +7,13 @@ use crate::state::{init_state, read_state};
 use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope, TxLegacy};
 use alloy_eips::eip6110::DepositRequest;
 use alloy_primitives::hex::FromHex;
-use alloy_primitives::{hex, Bytes, Signature, TxKind, U256};
+use alloy_primitives::{hex, keccak256, Bytes, Signature, TxKind, U256};
 use candid::{CandidType, Deserialize, Nat, Principal};
 use evm_rpc_canister_types::{
-    BlockTag, EthMainnetService, EthSepoliaService, EvmRpcCanister, GetTransactionCountArgs,
-    GetTransactionCountResult, MultiGetTransactionCountResult, MultiSendRawTransactionResult,
-    RequestResult, RpcService,
+    BlockTag, EthMainnetService, EthSepoliaService, EvmRpcCanister, FeeHistory, FeeHistoryArgs,
+    FeeHistoryResult, GetTransactionCountArgs, GetTransactionCountResult, MultiFeeHistoryResult,
+    MultiGetTransactionCountResult, MultiSendRawTransactionResult, RequestResult, RpcService,
+    RpcServices,
 };
 use ic_cdk::api::management_canister::ecdsa::{EcdsaCurve, EcdsaKeyId};
 use ic_cdk::{init, update};
@@ -206,72 +207,69 @@ fn estimate_transaction_fees() -> (u128, u128, u128) {
     (GAS_LIMIT, MAX_FEE_PER_GAS, MAX_PRIORITY_FEE_PER_GAS)
 }
 
-// TODO (fran): cambiar json por method .eth_fee_history directamente
 #[update]
-async fn estimate_transaction_fees_real() -> (u128, u128, u128) {
-    let json = r#"{
-        "jsonrpc": "2.0",
-        "method": "eth_feeHistory",
-        "params": [5, "latest", []],
-        "id": 11155111
-    }"#;
-
-    let max_response_size_bytes = 1000_u64;
+async fn avg_fees(block_count: u8) -> (u128, u128) {
     let num_cycles = 1_000_000_000u128;
-
     let ethereum_network = read_state(|s| s.ethereum_network());
 
-    let rpc_service = match ethereum_network {
-        EthereumNetwork::Mainnet => RpcService::EthMainnet(EthMainnetService::PublicNode),
-        EthereumNetwork::Sepolia => RpcService::EthSepolia(EthSepoliaService::PublicNode),
+    let rpc_services = match ethereum_network {
+        EthereumNetwork::Mainnet => {
+            RpcServices::EthMainnet(Some(vec![EthMainnetService::PublicNode]))
+        }
+        EthereumNetwork::Sepolia => {
+            RpcServices::EthSepolia(Some(vec![EthSepoliaService::PublicNode]))
+        }
+    };
+
+    let fee_history_args: FeeHistoryArgs = FeeHistoryArgs {
+        blockCount: Nat::from(block_count),
+        newestBlock: BlockTag::Latest,
+        rewardPercentiles: None,
     };
 
     // TODO (fran): algunas veces retorna "No consensus could be reached. Replicas had different responses"
     let (response,) = EVM_RPC
-        .request(
-            rpc_service,
-            json.to_string(),
-            max_response_size_bytes,
-            num_cycles,
-        )
+        .eth_fee_history(rpc_services, None, fee_history_args, num_cycles)
         .await
         .expect("RPC call failed");
 
-    let max_fee_per_gas = match response {
-        RequestResult::Ok(fee_history_result) => {
-            let eth_fee_history: EthFeeHistoryResponse =
-                serde_json::from_str(&fee_history_result).unwrap();
+    let (max_fee_per_gas, max_priority_fee_per_gas) = match response {
+        MultiFeeHistoryResult::Consistent(fee_history_result) => match fee_history_result {
+            FeeHistoryResult::Ok(val) => {
+                let val = val.unwrap();
+                let base_fees = &val.baseFeePerGas;
+                // let rewards = &val.reward;
 
-            // toma los ultimos 5 valores de baseFeePerGas
-            let base_fees = &eth_fee_history.result.baseFeePerGas;
-            let last_5_fees = &base_fees[base_fees.len() - 5..];
+                let last_x_fees = &base_fees[base_fees.len() - 5..];
+                // let last_x_rewards = &rewards[rewards.len() - 5..]; // FIXME (fran): rewards is empty
 
-            // convierte los valores hexadecimales a u128
-            let base_fees_u128: Vec<u128> = last_5_fees
-                .iter()
-                .map(|hex| u128::from_str_radix(&hex[2..], 16).unwrap())
-                .collect();
+                let total_fee: u128 = last_x_fees.iter().map(|n| nat_to_u128(n.clone())).sum();
+                // let total_reward: u128 = last_x_rewards
+                //     .iter()
+                //     .map(|v| nat_to_u128(v[0].clone()))
+                //     .sum();
 
-            // total de baseFeePerGas
-            let total_fee: u128 = base_fees_u128.iter().sum();
+                let avg_max_fee_per_gas = total_fee / last_x_fees.len() as u128;
+                // let avg_max_priority_fee_per_gas = total_reward / last_x_rewards.len() as u128;
 
-            // promedio de baseFeePerGas
-            let avg_max_fee_per_gas = total_fee / base_fees_u128.len() as u128;
-
-            avg_max_fee_per_gas
+                (
+                    avg_max_fee_per_gas,
+                    /*  avg_max_priority_fee_per_gas */ 1_500_000_000_u128,
+                )
+            }
+            FeeHistoryResult::Err(e) => {
+                panic!("Received an error response on `eth_fee_history`: {:?}", e);
+            }
+        },
+        MultiFeeHistoryResult::Inconsistent(inc) => {
+            panic!(
+                "Received an inconsistent response on `eth_fee_history`: {:?}",
+                inc
+            );
         }
-        RequestResult::Err(e) => panic!("Received an error response: {:?}", e),
     };
 
-    /// Standard gas limit for an Ethereum transfer to an EOA.
-    /// Other transactions, in particular ones interacting with a smart contract (e.g., ERC-20), would require a higher gas limit.
-    const GAS_LIMIT: u128 = 21_000;
-
-    /// Very crude estimates of max_fee_per_gas and max_priority_fee_per_gas.
-    /// A real world application would need to estimate this more accurately by for example fetching the fee history from the last 5 blocks.
-    // const MAX_FEE_PER_GAS: u128 = 50_000_000_000;
-    const MAX_PRIORITY_FEE_PER_GAS: u128 = 1_500_000_000;
-    (GAS_LIMIT, max_fee_per_gas, MAX_PRIORITY_FEE_PER_GAS)
+    (max_fee_per_gas, max_priority_fee_per_gas)
 }
 
 #[update]
@@ -294,7 +292,7 @@ async fn call_custom_sc() -> (String, u64, MultiSendRawTransactionResult) {
         nonce,
         gas_limit: calculate_gas_limit(
             value_hex,
-            "0x552410770000000000000000000000000000000000000000000000000000000000000007"
+            "0x5524107700000000000000000000000000000000000000000000000000000000001e8480"
                 .to_string(),
         )
         .await, // TODO (fran): ver como automatizar esto
@@ -394,23 +392,6 @@ async fn call_custom_sc2() -> (String, u64, MultiSendRawTransactionResult) {
         access_list: Default::default(),
     };
 
-    // let tx: txeip = TxLegacy {
-    //     chain_id,
-    //     nonce,
-    //     gas_price: max_fee_per_gas,
-    //     gas_limit,
-    //     to: TxKind::Call(
-    //         "0x46D1239bB2b9E0b1e14E475FD86ed4a3C3C1e31E"
-    //             .parse()
-    //             .expect("failed to parse recipient address"),
-    //     ),
-    //     value: nat_to_u256(Nat::from(0u8)),
-    // input: Bytes::from_hex(
-    //     "552410770000000000000000000000000000000000000000000000000000000000000007", // TODO (fran) ver esto
-    // )
-    //     .expect("failed to parse input"),
-    // };
-
     let wallet = EthereumWallet::new(caller).await;
     let tx_hash = tx.signature_hash().0;
     let (raw_signature, recovery_id) = wallet.sign_with_ecdsa(tx_hash).await;
@@ -475,7 +456,7 @@ async fn calculate_gas_limit(value: String, data: String) -> u128 {
                 "data": "{}"
                 }}
             ],
-            "id": 11155111
+            "id": 1
         }}"#,
         value, data
     );
@@ -517,46 +498,64 @@ async fn calculate_gas_limit(value: String, data: String) -> u128 {
 }
 
 #[update]
-async fn calculate_gas_limit2() -> RequestResult {
+async fn calculate_gas_limit2() -> String {
     // TODO (fran): ver como automatizar esto
     // TODO (fran): el data es para ese unico sc
 
-    let json = r#"{
-            "jsonrpc": "2.0",
-            "method": "eth_estimateGas",
-            "params": [
-                {
-                "from": "0x22Ff826A4af6408bdC07a63435744B61c0e71A1F",
-                "to": "0x46D1239bB2b9E0b1e14E475FD86ed4a3C3C1e31E",
-                "value": "0x1b1ae4d6e2ef500000000",
-                "data": "0x80f2d4f0"
-                }
-            ],
-            "id": 11155111
-        }"#;
+    let function_signature = "setValue(uint256)";
+    let function_hash = keccak256(function_signature);
+    let selector = &function_hash[..4]; // Primeros 4 bytes (8 caracteres hexadecimales)
 
-    let max_response_size_bytes = 1000_u64;
-    let num_cycles = 1_000_000_000u128;
+    // Paso 2: Convertir 2000000 a hexadecimal, 32 bytes alineados
+    let argument = 2000000u64;
+    let mut argument_encoded = vec![0u8; 32]; // 32 bytes llenos de ceros
+    argument_encoded[32 - 8..].copy_from_slice(&argument.to_be_bytes()); // Rellenar desde la derecha
 
-    let ethereum_network = read_state(|s| s.ethereum_network());
+    // Paso 3: Construir el payload completo (selector + argumento)
+    let mut data = Vec::new();
+    data.extend_from_slice(selector); // Agregar selector
+    data.extend_from_slice(&argument_encoded); // Agregar el argumento codificado
 
-    let rpc_service = match ethereum_network {
-        EthereumNetwork::Mainnet => RpcService::EthMainnet(EthMainnetService::PublicNode),
-        EthereumNetwork::Sepolia => RpcService::EthSepolia(EthSepoliaService::PublicNode),
-    };
+    let hex = hex::encode(data);
 
-    // TODO (fran): algunas veces retorna "No consensus could be reached. Replicas had different responses"
-    let (response,) = EVM_RPC
-        .request(
-            rpc_service,
-            json.to_string(),
-            max_response_size_bytes,
-            num_cycles,
-        )
-        .await
-        .expect("RPC call failed");
+    hex
 
-    response
+    // let json = r#"{
+    //         "jsonrpc": "2.0",
+    //         "method": "eth_estimateGas",
+    //         "params": [
+    //             {
+    //             "from": "0x22Ff826A4af6408bdC07a63435744B61c0e71A1F",
+    //             "to": "0x46D1239bB2b9E0b1e14E475FD86ed4a3C3C1e31E",
+    //             "value": "0x71AFD498D0000",
+    //             "gas": "0x5EE8"
+    //             }
+    //         ],
+    //         "id": 1
+    //     }"#;
+
+    // let max_response_size_bytes = 1000_u64;
+    // let num_cycles = 2_000_000_000u128;
+
+    // let ethereum_network = read_state(|s| s.ethereum_network());
+
+    // let rpc_service = match ethereum_network {
+    //     EthereumNetwork::Mainnet => RpcService::EthMainnet(EthMainnetService::PublicNode),
+    //     EthereumNetwork::Sepolia => RpcService::EthSepolia(EthSepoliaService::PublicNode),
+    // };
+
+    // // TODO (fran): algunas veces retorna "No consensus could be reached. Replicas had different responses"
+    // let (response,) = EVM_RPC
+    //     .request(
+    //         rpc_service,
+    //         json.to_string(),
+    //         max_response_size_bytes,
+    //         num_cycles,
+    //     )
+    //     .await
+    //     .expect("RPC call failed");
+
+    // response
 
     // match response {
     //     RequestResult::Ok(estimate_gas) => {
@@ -630,6 +629,13 @@ fn nat_to_u64(nat: Nat) -> u64 {
         .unwrap_or_else(|| ic_cdk::trap(&format!("Nat {} doesn't fit into a u64", nat)))
 }
 
+fn nat_to_u128(nat: Nat) -> u128 {
+    use num_traits::cast::ToPrimitive;
+    nat.0
+        .to_u128()
+        .unwrap_or_else(|| ic_cdk::trap(&format!("Nat {} doesn't fit into a u128", nat)))
+}
+
 fn nat_to_u256(value: Nat) -> U256 {
     let value_bytes = value.0.to_bytes_be();
     assert!(
@@ -668,3 +674,6 @@ struct EthEstimateGasResponse {
 
 // Enable Candid export
 ic_cdk::export_candid!();
+
+// 2_048_000_000_000_000_000_000_000
+// 70_509_978_562_327_059

@@ -53,7 +53,6 @@ type RejectionCode = variant {
   SysFatal;
   CanisterReject;
 };
-type RequestResult = variant { Ok : text; Err : RpcError };
 type RpcApi = record { url : text; headers : opt vec HttpHeader };
 type RpcError = variant {
   JsonRpcError : JsonRpcError;
@@ -87,11 +86,11 @@ type ValidationError = variant {
   InvalidHex : text;
 };
 service : (opt InitArg) -> {
+  avg_fees : (nat8) -> (nat, nat);
   calculate_gas_limit : (text, text) -> (nat);
-  calculate_gas_limit2 : () -> (RequestResult);
+  calculate_gas_limit2 : () -> (text);
   call_custom_sc : () -> (text, nat64, MultiSendRawTransactionResult);
   call_custom_sc2 : () -> (text, nat64, MultiSendRawTransactionResult);
-  estimate_transaction_fees_real : () -> (nat, nat, nat);
   ethereum_address : (opt principal) -> (text);
   get_balance : (opt text) -> (nat);
   send_eth : (text, nat) -> (text, nat64, MultiSendRawTransactionResult);
